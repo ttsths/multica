@@ -127,10 +127,11 @@ func localSkillRootsForProvider(provider string) ([]localSkillRoot, bool, error)
 		// (@oh-my-pi). Surface every user-level dir either variant
 		// discovers so the multica UI lists the same skills the runtime
 		// will load: Pi-mono scans ~/.pi/agent/skills; OMP's agents
-		// provider scans ~/.omp/agent/skills and ~/.agents/skills (the
-		// universal root below), and OMP's claude provider scans
-		// ~/.claude/skills. The universal ~/.agents/skills is appended
-		// below for all providers.
+		// provider scans ~/.omp/agent/skills and ~/.agents/skills, and
+		// OMP's claude provider scans ~/.claude/skills. This case returns
+		// early with the full set (including the universal ~/.agents/skills
+		// root) rather than going through the post-switch
+		// providerRoot+universal append used by the single-root providers.
 		return []localSkillRoot{
 			{path: filepath.Join(home, ".pi", "agent", "skills"), kind: localSkillRootProvider},
 			{path: filepath.Join(home, ".omp", "agent", "skills"), kind: localSkillRootProvider},
