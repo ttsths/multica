@@ -30,6 +30,7 @@ import { Text } from "@/components/ui/text";
 import { ActorAvatar } from "@/components/ui/actor-avatar";
 import { PriorityIcon } from "@/components/ui/priority-icon";
 import { StatusIcon } from "@/components/ui/status-icon";
+import { usePrefetchIssue } from "@/hooks/use-prefetch-issue";
 
 interface Props {
   issue: Issue;
@@ -39,8 +40,15 @@ interface Props {
 }
 
 export function IssueRow({ issue, onPress, showStatus = false }: Props) {
+  // Seed detail + prefetch timeline/attachments the instant the row is
+  // tapped, in parallel with navigation — see use-prefetch-issue.ts.
+  const prefetchIssue = usePrefetchIssue();
+  const handlePress = () => {
+    prefetchIssue(issue);
+    onPress();
+  };
   return (
-    <Pressable onPress={onPress} className="active:bg-secondary px-4 py-3">
+    <Pressable onPress={handlePress} className="active:bg-secondary px-4 py-3">
       <View className="flex-row items-center gap-3">
         {showStatus ? <StatusIcon status={issue.status} size={14} /> : null}
         <PriorityIcon priority={issue.priority} size={14} />

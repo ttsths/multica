@@ -57,7 +57,7 @@ export default function IssueDetail() {
   const wsId = useWorkspaceStore((s) => s.currentWorkspaceId);
   const qc = useQueryClient();
 
-  const detail = useQuery(issueDetailOptions(wsId, id));
+  const detail = useQuery(issueDetailOptions(wsId, id, qc));
   const timeline = useQuery(issueTimelineOptions(wsId, id));
 
   // Subscribe to per-issue WS events: status/priority/assignee/label
@@ -95,7 +95,15 @@ export default function IssueDetail() {
     ]);
   }, [detail, qc, wsId, id]);
 
-  const issue = detail.data;
+  const issue = detail.data ?? null;
+  // Render gating (loading-plan 方案 A + B): only full-screen the spinner
+  // when we have NO issue data at all (true cold start / deep link with an
+  // empty cache). The `initialData` seed from any cached issue list — plus
+  // the row-press `setQueryData` prefetch — means `detail.data` is usually
+  // present on the very first render, so the timeline paints immediately
+  // and the background detail refetch reconciles behind it. Timeline is
+  // never blocked by the detail request: it has its own query and renders
+  // its own inline spinner inside the FlashList header while loading.
   const deleteIssue = useDeleteIssue();
   const userId = useAuthStore((s) => s.user?.id ?? null);
   const { data: pins } = useQuery(pinListOptions(wsId, userId));
@@ -176,11 +184,11 @@ export default function IssueDetail() {
             : undefined,
         }}
       />
-      {detail.isLoading ? (
+      {detail.isPending && !issue ? (
         <View className="flex-1 items-center justify-center">
           <ActivityIndicator />
         </View>
-      ) : detail.error || !issue ? (
+      ) : !issue ? (
         <View className="flex-1 items-center justify-center px-6 gap-3">
           <Text className="text-sm text-destructive text-center">
             Failed to load issue:{" "}
