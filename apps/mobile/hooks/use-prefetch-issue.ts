@@ -34,9 +34,15 @@ export function usePrefetchIssue() {
   const wsId = useWorkspaceStore((s) => s.currentWorkspaceId);
 
   return useCallback(
-    (issue: Pick<Issue, "id" | "workspace_id">) => {
-      const scope = wsId ?? issue.workspace_id;
-      if (!scope || !issue?.id) return;
+    // The store's `currentWorkspaceId` is the single source of truth for
+    // the cache key prefix (`issues/<wsId>`). We deliberately do NOT fall
+    // back to `issue.workspace_id`: if the store has no current workspace,
+    // the row the user is tapping shouldn't be on screen at all, and
+    // seeding under a key derived from the row could populate a cache
+    // namespace the detail screen won't read from — a silent cache miss
+    // that defeats the prefetch.
+    (issue: Pick<Issue, "id">) => {
+      if (!wsId || !issue?.id) return;
       // Seed the detail cache from the list row we just tapped. We force
       // `updatedAt` to the epoch so React Query treats the seed as stale
       // and fires a background refetch (`GET /api/issues/:id`) to
@@ -45,12 +51,12 @@ export function usePrefetchIssue() {
       // immediately. Without this, `setQueryData` defaults `updatedAt` to
       // `now` and the 60s staleTime would suppress the reconciliation
       // fetch entirely.
-      qc.setQueryData(issueKeys.detail(scope, issue.id), issue, {
+      qc.setQueryData(issueKeys.detail(wsId, issue.id), issue, {
         updatedAt: 0,
       });
       // Kick timeline + attachments off in parallel with navigation.
-      void qc.prefetchQuery(issueTimelineOptions(scope, issue.id));
-      void qc.prefetchQuery(issueAttachmentsOptions(scope, issue.id));
+      void qc.prefetchQuery(issueTimelineOptions(wsId, issue.id));
+      void qc.prefetchQuery(issueAttachmentsOptions(wsId, issue.id));
     },
     [qc, wsId],
   );
