@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -14,7 +15,7 @@ func TestBuildPiArgsNoToolAllowlist(t *testing.T) {
 	// Extension tools registered via Pi's registerTool() must not be
 	// filtered out by a hardcoded --tools allowlist. Omitting --tools
 	// lets Pi use its full tool registry. See #2379.
-	args := buildPiArgs("test prompt", "/tmp/session.jsonl", ExecOptions{}, slog.Default())
+	args := buildPiArgs("test prompt", "/tmp/session.jsonl", "", false, ExecOptions{}, slog.Default())
 	for i, arg := range args {
 		if arg == "--tools" {
 			t.Errorf("buildPiArgs emits --tools %q; should not restrict tool registry (see #2379)", args[i+1])
@@ -23,7 +24,7 @@ func TestBuildPiArgsNoToolAllowlist(t *testing.T) {
 }
 
 func TestBuildPiArgsBasicFlags(t *testing.T) {
-	args := buildPiArgs("hello world", "/tmp/s.jsonl", ExecOptions{
+	args := buildPiArgs("hello world", "/tmp/s.jsonl", "", false, ExecOptions{
 		Model:        "anthropic/claude-sonnet-4-20250514",
 		SystemPrompt: "be helpful",
 	}, slog.Default())
@@ -43,7 +44,7 @@ func TestBuildPiArgsBasicFlags(t *testing.T) {
 
 func TestBuildPiArgsCustomArgsAppended(t *testing.T) {
 	// Users can still restrict tools via custom_args if desired.
-	args := buildPiArgs("prompt", "/tmp/s.jsonl", ExecOptions{
+	args := buildPiArgs("prompt", "/tmp/s.jsonl", "", false, ExecOptions{
 		CustomArgs: []string{"--tools", "read,bash"},
 	}, slog.Default())
 
@@ -116,6 +117,109 @@ func TestPiExecuteAttachesStdinPipe(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for result")
+	}
+}
+
+func TestBuildPiArgsOMPFirstRun(t *testing.T) {
+	// OMP first run: --session-dir under the workdir, no --session, no --resume.
+	args := buildPiArgs("hi", "", "/work/.omp-sessions", true, ExecOptions{Cwd: "/work"}, slog.Default())
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"--session-dir /work/.omp-sessions"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("expected %q in args, got: %v", want, args)
+		}
+	}
+	if strings.Contains(joined, "--session ") {
+		t.Errorf("OMP must not emit --session, got: %v", args)
+	}
+	if strings.Contains(joined, "--resume") {
+		t.Errorf("OMP first run must not emit --resume, got: %v", args)
+	}
+	if args[len(args)-1] != "hi" {
+		t.Errorf("prompt should be last arg, got %q", args[len(args)-1])
+	}
+}
+
+func TestBuildPiArgsOMPResume(t *testing.T) {
+	// OMP resume: --session-dir plus --resume pointing at the resolved jsonl.
+	args := buildPiArgs("hi", "/work/.omp-sessions/20260101T000000.000_abc.jsonl", "/work/.omp-sessions", true, ExecOptions{Cwd: "/work"}, slog.Default())
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--session-dir /work/.omp-sessions") {
+		t.Errorf("expected --session-dir, got: %v", args)
+	}
+	if !strings.Contains(joined, "--resume /work/.omp-sessions/20260101T000000.000_abc.jsonl") {
+		t.Errorf("expected --resume <jsonl>, got: %v", args)
+	}
+}
+
+func TestBuildPiArgsOMPBlocksResumeCustomArg(t *testing.T) {
+	// User custom_args must not override the daemon-managed --session-dir/--resume.
+	args := buildPiArgs("hi", "", "/work/.omp-sessions", true, ExecOptions{
+		Cwd:        "/work",
+		CustomArgs: []string{"--resume", "user/managed.jsonl", "--continue"},
+	}, slog.Default())
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "user/managed.jsonl") {
+		t.Errorf("custom --resume must be blocked, got: %v", args)
+	}
+	if strings.Contains(joined, "--continue") {
+		t.Errorf("--continue must be blocked on OMP, got: %v", args)
+	}
+}
+
+func TestIsOMPExecutable(t *testing.T) {
+	cases := map[string]bool{
+		"omp":                  true,
+		"/usr/local/bin/omp":   true,
+		"omp.exe":              true,
+		"./omp.exe":            true,
+		"pi":                   false,
+		"/home/u/.nvm/.../pi":  false,
+		"":                     false,
+		"omp-cli":              false,
+	}
+	for in, want := range cases {
+		if got := isOMPExecutable(in); got != want {
+			t.Errorf("isOMPExecutable(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestScanOMPSessionFile(t *testing.T) {
+	dir := t.TempDir()
+	// Empty dir: no session yet.
+	if _, ok := scanOMPSessionFile(dir); ok {
+		t.Fatal("expected ok=false on empty dir")
+	}
+	// Non-jsonl files are ignored.
+	if err := os.WriteFile(filepath.Join(dir, "README"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := scanOMPSessionFile(dir); ok {
+		t.Fatal("non-jsonl must be ignored")
+	}
+	// A jsonl is picked up.
+	session := filepath.Join(dir, "20260101T000000.000_abc.jsonl")
+	if err := os.WriteFile(session, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := scanOMPSessionFile(dir)
+	if !ok {
+		t.Fatal("expected ok=true after writing a jsonl")
+	}
+	if got != session {
+		t.Errorf("got %q, want %q", got, session)
+	}
+	// Newest wins.
+	newer := filepath.Join(dir, "20260102T000000.000_def.jsonl")
+	if err := os.WriteFile(newer, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Ensure mtime ordering on filesystems with coarse mtime resolution.
+	os.Chtimes(newer, time.Now(), time.Now().Add(time.Second))
+	got, _ = scanOMPSessionFile(dir)
+	if got != newer {
+		t.Errorf("expected newest jsonl %q, got %q", newer, got)
 	}
 }
 

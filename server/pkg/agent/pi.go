@@ -185,24 +185,53 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 
 	timeout := opts.Timeout
 
-	// Pi's --session flag expects a file path where events are appended.
-	// The path doubles as our opaque session identifier: we return it as
-	// SessionID and expect it back as ResumeSessionID on the next turn.
-	sessionPath := opts.ResumeSessionID
-	if sessionPath == "" {
-		p, err := newPiSessionPath()
-		if err != nil {
-			return nil, fmt.Errorf("pi session path: %w", err)
+	omp := isOMPExecutable(execName)
+
+	// Session handling diverges between Pi-mono and OMP:
+	//
+	//   - Pi-mono: --session <path> points at a file multica pre-creates
+	//     (ensurePiSessionFile). The path is our opaque session id; we
+	//     return it as SessionID and expect it back as ResumeSessionID.
+	//
+	//   - OMP: there is no --session flag. multica passes a task-scoped
+	//     --session-dir {cwd}/.omp-sessions/ so concurrent tasks on the
+	//     same agent don't share OMP's default {cwd-slug} session store
+	//     (max_concurrent_tasks defaults to 6). OMP writes its own
+	//     {ts}_{uuid}.jsonl there; on resume we point --resume at the
+	//     single jsonl we resolved. We never pre-create the jsonl — an
+	//     empty file would make --resume target nothing.
+	var sessionPath string // Pi-mono: session file. OMP: resolved resume jsonl ("" on first run).
+	var sessionDir string  // OMP only: the --session-dir value.
+	if omp {
+		sessionDir = ompSessionDir(opts.Cwd)
+		if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+			return nil, fmt.Errorf("omp session dir: %w", err)
 		}
-		sessionPath = p
-	}
-	if err := ensurePiSessionFile(sessionPath); err != nil {
-		return nil, fmt.Errorf("pi session file: %w", err)
+		// Prefer the explicit resume id (carried back as PriorSessionID);
+		// fall back to scanning the task-scoped dir for a prior jsonl,
+		// which covers the workdir-reuse resume path.
+		if opts.ResumeSessionID != "" {
+			sessionPath = opts.ResumeSessionID
+		} else if p, ok := scanOMPSessionFile(sessionDir); ok {
+			sessionPath = p
+		}
+	} else {
+		sessionPath = opts.ResumeSessionID
+		if sessionPath == "" {
+			p, err := newPiSessionPath()
+			if err != nil {
+				return nil, fmt.Errorf("pi session path: %w", err)
+			}
+			sessionPath = p
+		}
+		if err := ensurePiSessionFile(sessionPath); err != nil {
+			return nil, fmt.Errorf("pi session file: %w", err)
+		}
 	}
 
 	runCtx, cancel := runContext(ctx, timeout)
 
-	args := buildPiArgs(prompt, sessionPath, opts, b.cfg.Logger)
+	args := buildPiArgs(prompt, sessionPath, sessionDir, omp, opts, b.cfg.Logger)
 	argv0, cmdArgs := choosePiInvocation(execName, lookedUp, args, b.cfg.Logger)
 
 	cmd := exec.CommandContext(runCtx, argv0, cmdArgs...)
@@ -374,12 +403,22 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 
 		b.cfg.Logger.Info("pi finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
 
+		// On an OMP first run we didn't know the jsonl filename up front
+		// (OMP picks {ts}_{uuid}.jsonl). Resolve it now from the
+		// task-scoped session dir so the next turn can --resume it. On a
+		// resume run sessionPath already holds it.
+		finalSessionID := sessionPath
+		if omp && finalSessionID == "" && sessionDir != "" {
+			if p, ok := scanOMPSessionFile(sessionDir); ok {
+				finalSessionID = p
+			}
+		}
 		resCh <- Result{
 			Status:     finalStatus,
 			Output:     output.String(),
 			Error:      finalError,
 			DurationMs: duration.Milliseconds(),
-			SessionID:  sessionPath,
+			SessionID:  finalSessionID,
 			Usage:      usage,
 		}
 	}()
@@ -470,7 +509,8 @@ func decodePiResult(raw json.RawMessage) string {
 
 // piBlockedArgs are flags hardcoded by the daemon that must not be
 // overridden by user-configured custom_args. Overriding these would
-// break the daemon↔Pi communication protocol.
+// break the daemon↔Pi communication protocol. These guard the Pi-mono
+// launch variant (which uses --session).
 var piBlockedArgs = map[string]blockedArgMode{
 	"-p":        blockedStandalone, // non-interactive mode
 	"--print":   blockedStandalone, // alias for -p
@@ -478,25 +518,50 @@ var piBlockedArgs = map[string]blockedArgMode{
 	"--session": blockedWithValue,  // daemon manages the session path
 }
 
+// ompBlockedArgs guards the OMP launch variant. OMP has no --session
+// flag; the daemon owns --session-dir (task-scoped under the workdir)
+// and --resume (the jsonl resolved from it). --continue would let OMP
+// auto-pick a session from its default store, defeating the
+// task-scoping that keeps concurrent tasks from cross-wiring sessions.
+var ompBlockedArgs = map[string]blockedArgMode{
+	"-p":            blockedStandalone, // non-interactive mode
+	"--print":       blockedStandalone, // alias for -p
+	"--mode":        blockedWithValue,  // "json" event stream protocol
+	"--session-dir": blockedWithValue,  // daemon manages the task-scoped dir
+	"--resume":      blockedWithValue,  // daemon manages the resume jsonl
+	"--continue":    blockedStandalone, // daemon drives resume via --resume
+}
+
 // buildPiArgs assembles the argv for a one-shot Pi invocation.
 //
-// Flags:
+// Launch variants:
 //
-//	-p                          non-interactive mode (prompt is positional)
-//	--mode json                 emit one JSON event per line on stdout
-//	--session <path>            session log file (created upfront, reused on resume)
+//	Pi-mono:  -p --mode json --session <path> ...
+//	OMP:      -p --mode json [--session-dir <dir>] [--resume <path>] ...
+//
+// omp selects the variant. sessionDir is the OMP --session-dir (empty
+// for Pi-mono). sessionPath is the Pi-mono session file or the OMP jsonl
+// to --resume (empty on an OMP first run). Other flags:
+//
 //	--provider <name>           provider, when Model is "provider/id"
 //	--model <id>                model identifier
 //	--append-system-prompt <s>  extra system instructions
 //
 // Custom args appended before the positional prompt. The prompt is a
 // positional argument and must be last.
-func buildPiArgs(prompt, sessionPath string, opts ExecOptions, logger *slog.Logger) []string {
+func buildPiArgs(prompt, sessionPath, sessionDir string, omp bool, opts ExecOptions, logger *slog.Logger) []string {
 	args := []string{
 		"-p",
 		"--mode", "json",
 	}
-	if sessionPath != "" {
+	if omp {
+		if sessionDir != "" {
+			args = append(args, "--session-dir", sessionDir)
+		}
+		if sessionPath != "" {
+			args = append(args, "--resume", sessionPath)
+		}
+	} else if sessionPath != "" {
 		args = append(args, "--session", sessionPath)
 	}
 	if opts.Model != "" {
@@ -516,7 +581,11 @@ func buildPiArgs(prompt, sessionPath string, opts ExecOptions, logger *slog.Logg
 	if opts.SystemPrompt != "" {
 		args = append(args, "--append-system-prompt", opts.SystemPrompt)
 	}
-	args = append(args, filterCustomArgs(opts.CustomArgs, piBlockedArgs, logger)...)
+	blocked := piBlockedArgs
+	if omp {
+		blocked = ompBlockedArgs
+	}
+	args = append(args, filterCustomArgs(opts.CustomArgs, blocked, logger)...)
 	args = append(args, prompt)
 	return args
 }
@@ -565,6 +634,58 @@ func ensurePiSessionFile(path string) error {
 		return err
 	}
 	return f.Close()
+}
+
+// isOMPExecutable reports whether the resolved executable is the OMP
+// ("Oh My Pi", @oh-my-pi/pi-coding-agent) distribution rather than
+// Pi-mono. Both speak the pi session-v3 event protocol; only launch
+// flags and side-channel paths differ, so we branch on the binary
+// basename. A runtime profile with command_name=omp (or an absolute
+// path ending in omp) routes here.
+func isOMPExecutable(execName string) bool {
+	name := filepath.Base(filepath.Clean(execName))
+	name = strings.TrimSuffix(name, ".exe")
+	return name == "omp"
+}
+
+// ompSessionDir is the task-scoped directory passed to OMP's
+// --session-dir. Anchoring it under the task workdir (rather than OMP's
+// default ~/.omp/agent/sessions/{cwd-slug}/) keeps concurrent tasks on
+// the same agent from cross-wiring sessions via "newest file" scans
+// (max_concurrent_tasks defaults to 6).
+func ompSessionDir(workDir string) string {
+	if workDir == "" {
+		workDir = "."
+	}
+	return filepath.Join(workDir, ".omp-sessions")
+}
+
+// scanOMPSessionFile returns the jsonl OMP wrote into sessionDir, picking
+// the newest on the rare chance more than one exists. Returns ok=false
+// when the dir is absent or holds no jsonl (a first run). Used both to
+// detect a workdir-reuse resume (before launch) and to resolve the
+// SessionID to hand back after an OMP first run.
+func scanOMPSessionFile(sessionDir string) (path string, ok bool) {
+	entries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return "", false
+	}
+	var newest string
+	var newestMod time.Time
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if newest == "" || info.ModTime().After(newestMod) {
+			newest = filepath.Join(sessionDir, e.Name())
+			newestMod = info.ModTime()
+		}
+	}
+	return newest, newest != ""
 }
 
 // PiSessionDir exposes piSessionDir to other packages in this module.

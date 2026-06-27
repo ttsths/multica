@@ -66,6 +66,17 @@ func writeContextFiles(workDir, provider string, ctx TaskContextForEnv, manifest
 			if err := writeSkillFiles(skillsDir, ctx.AgentSkills, manifest); err != nil {
 				return fmt.Errorf("write skill files: %w", err)
 			}
+			// Mirror multica-injected skills into the pi-variant scan dirs
+			// (Pi-mono's .pi/skills/) so the shared protocol family keeps
+			// working for both OMP and Pi-mono. A mirror write failure is
+			// surfaced like the primary: injected skills are required for
+			// the agent to run its workflow, so a half-written mirror is
+			// worse than failing prep loudly.
+			for _, mirror := range piSkillMirrorDirs(workDir, provider) {
+				if err := writeSkillFiles(mirror, ctx.AgentSkills, manifest); err != nil {
+					return fmt.Errorf("write skill mirror %s: %w", mirror, err)
+				}
+			}
 		}
 	}
 
@@ -167,6 +178,30 @@ func resolveSkillsDir(workDir, provider string, manifest *sidecarManifest) (stri
 	return skillsDir, nil
 }
 
+// piSkillMirrorDirs returns the extra project-level skill dirs multica
+// writes into for the pi protocol family so both launch variants of the
+// shared family discover injected skills: OMP scans .agents/skills/ (the
+// primary returned by skillsDirPath), Pi-mono scans .pi/skills/. Returns
+// nil for every other provider (single injection target). These dirs are
+// also returned by skillManagedParents so the reuse-path rollback cleans
+// them up alongside the primary.
+func piSkillMirrorDirs(workDir, provider string) []string {
+	if provider != "pi" {
+		return nil
+	}
+	return []string{filepath.Join(workDir, ".pi", "skills")}
+}
+
+// skillManagedParents lists every project-level skill parent the daemon
+// writes managed skill dirs into for a provider: the primary from
+// skillsDirPath plus any mirrors. Used by the reuse-path rollback to reap
+// all managed skill roots the prior run recorded.
+func skillManagedParents(workDir, provider string) []string {
+	parents := []string{skillsDirPath(workDir, provider)}
+	parents = append(parents, piSkillMirrorDirs(workDir, provider)...)
+	return parents
+}
+
 // skillsDirPath returns the provider-native skills parent directory under
 // workDir WITHOUT creating it or recording anything. resolveSkillsDir wraps
 // this with the MkdirAll/manifest bookkeeping; the reuse-path skill rollback
@@ -202,8 +237,14 @@ func skillsDirPath(workDir, provider string) string {
 		// no openclaw scan path ever inspected.
 		return filepath.Join(workDir, "skills")
 	case "pi":
-		// Pi natively discovers skills from .pi/skills/ in the workdir.
-		return filepath.Join(workDir, ".pi", "skills")
+		// The pi protocol family is shared by Pi-mono (@earendil-works)
+		// and OMP (@oh-my-pi, "Oh My Pi"). They scan different project-
+		// level dirs: OMP's agents provider walks .agents/skills/ (and
+		// .claude/skills/), Pi-mono scans .pi/skills/. Inject into
+		// .agents/skills/ as the primary (OMP target) and mirror into
+		// .pi/skills/ so Pi-mono installs keep discovering multica-injected
+		// skills. See piSkillMirrorDirs.
+		return filepath.Join(workDir, ".agents", "skills")
 	case "cursor":
 		// Cursor natively discovers skills from .cursor/skills/ in the workdir.
 		return filepath.Join(workDir, ".cursor", "skills")
